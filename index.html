@@ -54,6 +54,7 @@ const API='https://lomnfbdkuwnfyuamvhbp.supabase.co', PUBLIC_KEY='sb_publishable
 let session=null,cloudReady=false,cloudBusy=false,cloudMessages=[],thread=null;
 try{session=JSON.parse(localStorage.getItem('unik41-session'))}catch{}
 async function request(path,method='GET',body,extra={}){
+ if(session?.expires_at&&session.expires_at*1000<Date.now()+60000&&!path.startsWith('/auth/'))await restoreSession();
  const headers={apikey:PUBLIC_KEY,...extra};if(session?.access_token)headers.Authorization='Bearer '+session.access_token;
  if(body!==undefined&&!(body instanceof Blob))headers['Content-Type']='application/json';
  const r=await fetch(API+path,{method,headers,body:body===undefined?undefined:body instanceof Blob?body:JSON.stringify(body)});
@@ -81,7 +82,7 @@ function needLogin(){if(session)return false;nav('profile');toast('Войдит�
 function cloudRatingOwner(id){return id==='me'?session.user.id:id}
 startChat=async function(id){if(needLogin())return;const a=state.ads.find(a=>a.id===id);thread={listing:id,peer:a.cloudOwner};page='chat';$('#modal').close();render()};
 function conversations(){const map=new Map();for(const m of cloudMessages){const peer=m.sender_id===session.user.id?m.recipient_id:m.sender_id;map.set(m.listing_id+':'+peer,{listing:m.listing_id,peer})}if(thread)map.set(thread.listing+':'+thread.peer,thread);return [...map.values()]}
-chat=function(){if(!session)return authView();const conv=conversations();const a=state.ads.find(a=>a.id===thread?.listing),peer=thread?sellers[thread.peer]:null;return `<h2>Сообщения</h2><button id="refreshCloud">Обновить сообщения</button><p class="notice">Настоящая переписка между аккаунтами. Нажмите «Обновить сообщения», чтобы получить новые ответы. Переписка удаляется вместе с объявлением.</p><div class="chips">${conv.map(c=>`<button data-cloud-thread="${c.listing}:${c.peer}">${esc(sellers[c.peer]?.name||'Пользователь')} · ${esc(state.ads.find(a=>a.id===c.listing)?.title||'Объявление')}</button>`).join('')}</div>${a?`<div class="panel"><h3>${esc(a.title)}</h3><p>${esc(peer?.name||'Пользователь')}</p><div id="messages">${cloudMessages.filter(m=>m.listing_id===thread.listing&&[m.sender_id,m.recipient_id].includes(thread.peer)).map(m=>`<div class="message ${m.sender_id===session.user.id?'me':''}">${esc(m.body)}</div>`).join('')||'<p>Начните разговор.</p>'}</div><form id="cloudchatform" class="search"><input name="message" required maxlength="1500" aria-label="Сообщение" placeholder="Ваше сообщение"><button class="primary">Отправить</button></form></div>`:'<p class="empty">Откройте объявление и нажмите «Написать».</p>'}`};
+chat=function(){if(!session)return authView();const conv=conversations();const a=state.ads.find(a=>a.id===thread?.listing),peer=thread?sellers[thread.peer]:null;return `<h2>Сообщения</h2><button id="refreshCloud">Обновить сообщения</button><p class="notice" id="messageSyncStatus">Новые сообщения проверяются автоматически каждые 5 секунд, пока сайт открыт. Переписка удаляется вместе с объявлением.</p><div class="chips">${conv.map(c=>`<button data-cloud-thread="${c.listing}:${c.peer}">${esc(sellers[c.peer]?.name||'Пользователь')} · ${esc(state.ads.find(a=>a.id===c.listing)?.title||'Объявление')}</button>`).join('')}</div>${a?`<div class="panel"><h3>${esc(a.title)}</h3><p>${esc(peer?.name||'Пользователь')}</p><div id="messages">${cloudMessages.filter(m=>m.listing_id===thread.listing&&[m.sender_id,m.recipient_id].includes(thread.peer)).map(m=>`<div class="message ${m.sender_id===session.user.id?'me':''}">${esc(m.body)}</div>`).join('')||'<p>Начните разговор.</p>'}</div><form id="cloudchatform" class="search"><input name="message" required maxlength="1500" aria-label="Сообщение" placeholder="Ваше сообщение"><button class="primary">Отправить</button></form></div>`:'<p class="empty">Откройте объявление и нажмите «Написать».</p>'}`};
 const originalDetail=detail,originalSellerView=sellerView;
 detail=function(id){originalDetail(id);const m=$('#modal');m.innerHTML=m.innerHTML.replace('ДЕМОНСТРАЦИОННОЕ ОБЪЯВЛЕНИЕ','ОБЪЯВЛЕНИЕ').replace('Написать · демо','Написать')};
 sellerView=function(id){originalSellerView(id);$('#modal').innerHTML=$('#modal').innerHTML.replace('Оставить демо-отзыв','Оставить отзыв').replace('Сохранить на устройстве','Опубликовать отзыв')};
@@ -105,8 +106,33 @@ document.addEventListener('submit',e=>{const f=e.target;if(!['authform','adform'
  if(f.id==='cloudchatform'){const body=fd.get('message').trim();if(!body)return;await request('/rest/v1/messages','POST',{listing_id:thread.listing,sender_id:session.user.id,recipient_id:thread.peer,body});await refreshCloud();render();$('#messages')?.lastElementChild?.scrollIntoView({block:'nearest'})}
  });
 },true);
-// Refresh on return to the tab; edits are never replaced while the user is typing.
-document.addEventListener('visibilitychange',()=>{if(!document.hidden&&cloudReady&&!cloudBusy&&!['post','profile'].includes(page))task(async()=>{await refreshCloud();render()})});
+// Only conversation content is refreshed. Form drafts and photo selections stay intact.
+let messagePolling=false,messageSyncFailed=false;
+function messageReadMap(){try{return JSON.parse(localStorage.getItem('unik41-read-'+session.user.id))||{}}catch{return {}}}
+function messageKey(m){return m.listing_id+':'+(m.sender_id===session.user.id?m.recipient_id:m.sender_id)}
+function updateUnread(){
+ if(!session){document.title='UNIK41 · Камчатка рядом';return}
+ const read=messageReadMap();
+ if(page==='chat'&&thread&&!document.hidden&&!$('#modal').open){const key=thread.listing+':'+thread.peer;for(const m of cloudMessages.filter(m=>messageKey(m)===key)){const stamp=Date.parse(m.created_at)||0;read[key]=Math.max(read[key]||0,stamp)}try{localStorage.setItem('unik41-read-'+session.user.id,JSON.stringify(read))}catch{}}
+ const count=cloudMessages.filter(m=>m.recipient_id===session.user.id&&(Date.parse(m.created_at)||0)>(read[messageKey(m)]||0)).length;
+ const btn=document.querySelector('.bottom [data-nav="chat"]');if(btn){btn.querySelector('.unread-badge')?.remove();btn.setAttribute('aria-label',count?'Сообщения: '+count+' непрочитанных':'Сообщения');if(count)btn.insertAdjacentHTML('beforeend',`<span class="unread-badge" style="display:inline-block;background:#c6394f;color:white;border-radius:20px;padding:2px 6px;font-weight:700;margin-left:4px" aria-live="polite">${count>99?'99+':count}</span>`)}
+ document.title=(count?'('+count+') ':'')+'UNIK41 · Камчатка рядом';
+}
+const renderWithCloud=render;render=function(){renderWithCloud();updateUnread()};
+async function syncMessages(){
+ if(!session||!cloudReady||cloudBusy||messagePolling||document.hidden||!navigator.onLine)return;
+ messagePolling=true;try{
+ const oldIds=new Set(cloudMessages.map(m=>m.id));const fresh=await request('/rest/v1/messages?select=*&order=created_at.asc');
+ const incoming=fresh.filter(m=>!oldIds.has(m.id)&&m.recipient_id===session.user.id);
+ const changed=JSON.stringify(fresh)!==JSON.stringify(cloudMessages);cloudMessages=fresh;messageSyncFailed=false;
+ if(changed&&page==='chat'&&!$('#modal').open){const input=$('#cloudchatform [name=message]'),draft=input?.value||'',focused=input===document.activeElement,start=input?.selectionStart,end=input?.selectionEnd;const y=window.scrollY;render();const next=$('#cloudchatform [name=message]');if(next){next.value=draft;if(focused){next.focus({preventScroll:true});next.setSelectionRange(start,end)}}window.scrollTo(0,y)}
+ updateUnread();const outside=incoming.some(m=>page!=='chat'||!thread||messageKey(m)!==thread.listing+':'+thread.peer||$('#modal').open);if(outside)toast('Новое сообщение! Откройте раздел «Сообщения».');
+ const status=$('#messageSyncStatus');if(status)status.textContent='Новые сообщения проверяются автоматически каждые 5 секунд, пока сайт открыт. Последняя проверка: '+new Date().toLocaleTimeString('ru-RU');
+ }catch(e){messageSyncFailed=true;const status=$('#messageSyncStatus');if(status)status.textContent='Не удалось обновить сообщения. Проверьте интернет; повторим автоматически.'}finally{messagePolling=false}
+}
+setInterval(syncMessages,5000);
+document.addEventListener('visibilitychange',()=>{if(!document.hidden)syncMessages()});
+window.addEventListener('online',syncMessages);
 (async()=>{if(location.hash.includes('access_token=')||location.hash.includes('error=')){const params=new URLSearchParams(location.hash.slice(1));const error=params.get('error_description');history.replaceState(null,'',location.pathname);toast(error||'Почта подтверждена. Войдите в свой аккаунт.');page='profile'}state.ads=[];state.reviews=[];state.favorites=[];state.chats={};render();await restoreSession();try{await refreshCloud();render()}catch(e){$('#app').innerHTML='<h2>Не удалось подключиться</h2><p class="notice">Проверьте интернет и повторите загрузку. Локальные демо-данные не публикуются автоматически.</p><button id="refreshCloud">Повторить подключение</button>';toast(e.message)}})();
 
 </script></body></html>
